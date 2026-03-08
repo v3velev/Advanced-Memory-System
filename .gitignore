@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Dependencies
+node_modules/
+
+# Database
+data/
+memory-backup.db
+*.db
+*.db-shm
+*.db-wal
+
+# Runtime
+worker.pid
+worker.log
+.watchdog-failures
+.node-path
+
+# Logs
+logs/
+
+# Session data
+seen/
+snapshots/
+.claude-trace/
+
+# Test artifacts
+_test_transcript.jsonl
