@@ -1,5 +1,5 @@
 #!/bin/bash
-# UserPromptSubmit Hook: Inhibitory gating - only inject on high-confidence signal matches
+# UserPromptSubmit Hook: Signal-based + intent-based memory injection
 # Timeout: 500ms - MUST be fast
 # Output to stdout becomes additionalContext prepended to user message
 
@@ -31,6 +31,7 @@ fi
 
 SEARCH_TERM=""
 SIGNAL_TYPE=""
+CONFIDENCE_FLOOR="0.70"
 
 # Signal 1: Explicit file paths (src/components/Foo.tsx)
 FILE_MATCH=$(echo "$PROMPT" | grep -oE 'src/[a-zA-Z0-9/_.-]+\.[a-z]+' | head -1)
@@ -75,14 +76,30 @@ if [ -z "$SEARCH_TERM" ]; then
   fi
 fi
 
+# Signal 5: Intent matching - extract significant terms from any prompt >= 40 chars
+# Higher confidence bar (0.80) since this is a broad match without a specific signal
+if [ -z "$SEARCH_TERM" ] && [ ${#PROMPT} -ge 40 ]; then
+  RAW_TERM=$(echo "$PROMPT" | head -c 120)
+  # Sanitize FTS5 operators
+  RAW_TERM=$(echo "$RAW_TERM" | sed 's/[()\"*^{}:]//g' | sed 's/\bAND\b//gi; s/\bOR\b//gi; s/\bNOT\b//gi; s/\bNEAR\b//gi')
+  # Require 3+ non-stopword terms (stricter than signal 4)
+  STOPWORDS='this|that|with|from|have|been|were|what|when|will|your|just|like|also|than|then|them|into|some|could|would|should|about|after|before|other|which|their|there|these|those|being|doing|going|using|where|while|does|each|make|made|need|only|over|same|such|take|want|very|more|most|much|many|here|back|know|well|even|work|look|time|sure|used|part|seem|find|next|call|name|tool|read|edit|near|help|please|think|want|lets|change|update|create|write|move|check|show'
+  SIGNIFICANT=$(echo "$RAW_TERM" | tr '[:upper:]' '[:lower:]' | grep -oE '\b[a-z]{4,}\b' | grep -viE "^($STOPWORDS)$" | sort -u)
+  SIG_COUNT=$(echo "$SIGNIFICANT" | grep -c '[a-z]')
+  if [ "$SIG_COUNT" -ge 3 ]; then
+    SEARCH_TERM="$RAW_TERM"
+    SIGNAL_TYPE="terms"
+    CONFIDENCE_FLOOR="0.80"
+  fi
+fi
+
 # No signal detected - stay silent
 [ -z "$SEARCH_TERM" ] && exit 0
 
 # Search knowledge atoms via FTS5
-# Confidence >= 0.70 for auto-injection (higher bar than on-demand search)
 SAFE_TERM="${SEARCH_TERM//\'/\'\'}"
 
-# Phrase match for precise signals (1-3), OR-based for multi-word Signal 4
+# Phrase match for precise signals (1-3), OR-based for multi-word Signal 4/5
 if [ "$SIGNAL_TYPE" = "terms" ]; then
   # Convert to OR query: extract significant words
   FTS_MATCH=$(echo "$SAFE_TERM" | grep -oE '\b[a-zA-Z]{4,}\b' | head -5 | tr '\n' ' ' | sed 's/ *$//' | sed 's/ / OR /g')
@@ -94,7 +111,7 @@ fi
 
 ATOMS=$(sqlite3 "$DB_PATH" ".timeout 3000" -separator '|' "
   SELECT k.id, k.type, k.content FROM knowledge k
-  WHERE k.status = 'active' AND k.confidence >= 0.70
+  WHERE k.status = 'active' AND k.confidence >= $CONFIDENCE_FLOOR
   AND (k.injection_success_rate IS NULL OR k.injection_success_rate >= 0.20)
   AND (
     k.id IN (SELECT rowid FROM knowledge_fts WHERE knowledge_fts MATCH '$FTS_MATCH')

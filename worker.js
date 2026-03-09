@@ -270,32 +270,45 @@ async function generateEmbeddings(texts) {
 
 // ── Claude CLI for Sonnet Extraction ────────────────────────────────────────
 
-const EXTRACTION_SYSTEM_PROMPT = `You are a highly selective knowledge extraction system. Extract ONLY knowledge that will change how the assistant behaves in future sessions.
+const EXTRACTION_SYSTEM_PROMPT = `You are a brutally selective knowledge extraction system. You produce PRESCRIPTIVE INSTRUCTIONS - not journal entries, not status reports, not observations.
 
-=== THREE GATES - ALL MUST PASS ===
+=== FOUR GATES - ALL MUST PASS ===
 
-1. NOT GENERIC: Is this specific to the user's projects or preferences? "Use transactions for atomicity" fails. "Nurch uses Clerk because Supabase auth didn't support LinkedIn OAuth" passes.
+1. NOT GENERIC: Specific to the user's projects or preferences? "Use transactions for atomicity" FAILS. "Don't suggest Nylas for Nurch - evaluated it, 3x too expensive" PASSES.
 
-2. NOT IN THE CODE: Could the assistant figure this out by reading the codebase? Architecture, schema, config are all discoverable. Business decisions, rejected alternatives, user constraints, debugging journeys are NOT.
+2. NOT IN THE CODE: Could the assistant discover this by reading the codebase? Schema, config, file structure, API routes are all discoverable. Rejected alternatives, constraints, debugging dead-ends are NOT.
 
-3. CHANGES BEHAVIOR: If this atom appears in a future session, does the assistant do something differently? "Cosine threshold is 0.20" changes nothing. "Don't suggest Nylas, we evaluated it and it's 3x too expensive" prevents wasted time.
+3. CHANGES BEHAVIOR: If injected into a future session, does the assistant concretely do something differently? The atom must prevent a specific mistake or shortcut a specific decision.
 
-MOST SESSIONS (80%+) YIELD ZERO ATOMS. This is correct. Only extract when something genuinely important happened.
+4. DURABLE: Would this still prevent a mistake or save time 2 weeks from now? Atoms about in-progress work, current bugs being fixed, or temporary state FAIL.
+
+MOST SESSIONS (90%+) YIELD ZERO ATOMS. This is correct.
+
+=== PRESCRIPTIVE FORMAT ===
+
+Every atom content MUST follow: "When X, do/don't Y because Z"
+- "When adding OAuth providers, don't use Supabase auth - it lacks LinkedIn support, use Clerk instead"
+- "When the user challenges an approach, push back with reasoning - they prefer direct disagreement"
+- "Don't suggest sqlite-vec INSERT OR IGNORE - vec0 tables don't support it, check existence first"
+
+NOT acceptable:
+- "We fixed the migration bug" (journal entry)
+- "The schema now has a trigger_type column" (discoverable state)
+- "Spent 2 hours debugging the FTS issue" (narrative)
 
 === SCOPE ===
 
-"scope" determines whether knowledge is project-specific or cross-project:
-- "project": Only useful for THIS specific codebase/product. Remove the project name - does it still make sense? If not, it's project.
-- "global": Useful regardless of which project. User preferences, working style, cross-cutting tool choices.
-
-Examples: "Nurch uses Clerk for auth" = project. "Always challenge my ideas" = global. "Unipile webhook missing email body" = project. "Ship fast, bugs OK" = global.
+- "project": Only useful for THIS codebase. Remove the project name - still make sense? If not, project.
+- "global": User preferences, working style, cross-cutting tool choices.
 
 === DO NOT EXTRACT ===
-- Implementation details discoverable from code (file paths, schema, config)
-- Generic programming knowledge any LLM already knows
-- Process commentary about the conversation itself
+- Task completion reports ("implemented X", "added Y", "fixed Z")
+- Bugs that are already fixed (the fix is in the code now)
+- Code/schema/config state (read the codebase instead)
+- Meta-observations about the conversation or workflow
 - One-off fixes unlikely to recur
-- Multiple atoms about the same thing
+- Implementation details the assistant can discover by reading files
+- Descriptions of what was built or changed
 
 === RESPONSE FORMAT ===
 
@@ -304,34 +317,31 @@ Respond with ONLY a raw JSON object. No markdown code fences. No explanation.
 {
   "atoms": [
     {
-      "content": "The core knowledge - one clear sentence of what matters",
-      "context": "The full war story with every detail",
-      "scope": "project|global"
+      "content": "When X, do/don't Y because Z",
+      "context": "brief context, max 200 chars",
+      "scope": "project|global",
+      "justification": "which gates this passes and why"
     }
   ],
+  "obsolete_atom_ids": [],
   "thread_priority": "critical|significant|routine",
   "impasse_severity": 0.0
 }
 
 Rules:
-- Maximum 3 atoms. Most sessions produce 0.
+- Maximum 2 atoms. Most sessions produce 0.
 - thread_priority and impasse_severity are ALWAYS required.
-- "content" is the headline - concise, what matters.
-- "context" is the full war story. Step by step, chronological, include EVERYTHING:
-  - What was tried first and what happened
-  - Specific bugs, errors, or issues encountered along the way
-  - How those bugs were debugged and solved (exact steps, commands, fixes)
-  - Which alternatives were actually attempted vs just discussed
-  - Why things failed - specific technical reasons, not vague summaries
-  - The exact path from problem to solution
-  This is the most valuable part. Be detailed. Include error messages, API responses, config issues, version conflicts - the messy reality, not a clean summary.
-- Do NOT add any fields beyond content, context, scope. No "type" field.`;
+- "content" is a prescriptive instruction - "When X, do/don't Y because Z".
+- "context" is a brief note (max 200 chars) on when/why this matters. NOT a war story.
+- "justification" explains which of the 4 gates this passes and why it's durable.
+- "obsolete_atom_ids" lists IDs of existing atoms that are now outdated (bug fixed, task done, info changed). Check the EXISTING ATOMS section.
+- Do NOT add any fields beyond content, context, scope, justification. No "type" field.`;
 
-function callClaudeCLI(prompt, systemPrompt) {
+function callClaudeCLI(prompt, systemPrompt, model = "sonnet") {
   return new Promise((resolve, reject) => {
     const args = [
       "-p",
-      "--model", "sonnet",
+      "--model", model,
       "--output-format", "json",
       "--tools", "",
       "--no-session-persistence",
@@ -414,6 +424,52 @@ async function extractViaCLI(transcriptText, existingAtomsContext = "") {
       log(`  Retry parse also failed: ${retryErr.message}`);
       throw new Error(`Extraction parse failed after retry: ${retryErr.message}`);
     }
+  }
+}
+
+// ── Second-pass Atom Validator ───────────────────────────────────────────────
+
+const VALIDATOR_SYSTEM_PROMPT = `You validate knowledge atoms. For each atom, answer KEEP or REJECT.
+
+REJECT if ANY of these are true:
+- Descriptive, not prescriptive (describes what happened vs instructs what to do)
+- Would be stale in 2 weeks (about in-progress work, current bugs, temporary state)
+- Discoverable from code (schema, config, file structure)
+- Weak justification (vague about which gates it passes)
+- Journal entry disguised as instruction ("We learned that X" instead of "When X, do Y")
+
+Respond with ONLY a raw JSON object:
+{"results": [{"index": 0, "verdict": "KEEP|REJECT", "reason": "brief reason"}]}`;
+
+async function validateAtoms(atoms) {
+  if (!atoms || atoms.length === 0) return [];
+
+  const prompt = atoms.map((a, i) =>
+    `[${i}] content: ${a.content}\n    context: ${a.context || ""}\n    justification: ${a.justification || ""}`
+  ).join("\n\n");
+
+  try {
+    const envelope = await callClaudeCLI(prompt, VALIDATOR_SYSTEM_PROMPT, "haiku");
+    const costUsd = envelope.total_cost_usd || 0;
+    log(`  Validator: $${costUsd.toFixed(4)}`);
+    const result = parseExtractionResult(envelope.result);
+    const results = Array.isArray(result.results) ? result.results : [];
+
+    const kept = [];
+    for (let i = 0; i < atoms.length; i++) {
+      const verdict = results.find(r => r.index === i);
+      if (verdict && verdict.verdict === "REJECT") {
+        log(`  Validator: REJECTED [${i}] "${atoms[i].content.slice(0, 80)}" - ${verdict.reason}`);
+      } else {
+        kept.push(atoms[i]);
+      }
+    }
+    log(`  Validator: ${kept.length}/${atoms.length} kept`);
+    return kept;
+  } catch (err) {
+    // Fail-open: if Haiku errors, keep all atoms
+    log(`  Validator failed (keeping all): ${err.message}`);
+    return atoms;
   }
 }
 
@@ -532,7 +588,11 @@ async function storeAtom(db, { content, type, scope, project, projectName, sourc
   // Merge metadata into content so it's visible at injection time
   let atomContent = content;
   if (metadata && typeof metadata === "object" && Object.keys(metadata).length > 0) {
-    const skip = new Set(["scope", "key_exchange_snippet"]);
+    const skip = new Set(["scope", "key_exchange_snippet", "justification"]);
+    // Cap context at 200 chars
+    if (metadata.context && typeof metadata.context === "string" && metadata.context.length > 200) {
+      metadata.context = metadata.context.slice(0, 200);
+    }
     const entries = Object.entries(metadata).filter(([k]) => !skip.has(k));
     if (entries.length > 0) {
       const metaLines = entries.map(([k, v]) => {
@@ -797,7 +857,7 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
           `SELECT id, type, content FROM knowledge WHERE id IN (${ids.map(() => '?').join(',')}) AND status = 'active'`
         ).all(...ids);
         if (atoms.length > 0) {
-          existingAtomsContext = "\n\n=== EXISTING KNOWLEDGE (do NOT re-extract these) ===\n" +
+          existingAtomsContext = "\n\n=== EXISTING ATOMS (do NOT re-extract) ===\nIf any are now obsolete (bug fixed, task done, info outdated), add their IDs to obsolete_atom_ids.\n" +
             atoms.map(a => `[#${a.id}] [${a.type}] ${a.content}`).join("\n");
         }
       }
@@ -819,12 +879,15 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
   let atomCount = 0;
   const impasseSeverity = extraction.impasse_severity || 0.0;
 
-  const atoms = Array.isArray(extraction.atoms) ? extraction.atoms : [];
+  let atoms = Array.isArray(extraction.atoms) ? extraction.atoms : [];
+  atoms = await validateAtoms(atoms);
+
   for (const item of atoms) {
     if (!item.content) continue;
     try {
       const meta = {};
       if (item.context) meta.context = item.context;
+      if (item.justification) meta.justification = item.justification;
 
       const scope = item.scope || "project";
       await storeAtom(db, {
@@ -842,6 +905,21 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
       atomCount++;
     } catch (err) {
       log(`  Failed to store atom: ${err.message}`);
+    }
+  }
+
+  // Step 7.1: Archive obsolete atoms flagged by extraction
+  const obsoleteIds = Array.isArray(extraction.obsolete_atom_ids) ? extraction.obsolete_atom_ids : [];
+  for (const atomId of obsoleteIds) {
+    try {
+      const existing = db.prepare("SELECT id, status FROM knowledge WHERE id = ? AND status = 'active'").get(atomId);
+      if (existing) {
+        db.prepare("UPDATE knowledge SET status = 'archived' WHERE id = ?").run(atomId);
+        try { db.prepare("DELETE FROM knowledge_embeddings WHERE atom_id = ?").run(atomId); } catch {}
+        log(`  Archived obsolete atom #${atomId}`);
+      }
+    } catch (err) {
+      log(`  Failed to archive obsolete atom #${atomId}: ${err.message}`);
     }
   }
 
@@ -884,17 +962,17 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
 
 // ── Hindsight Extraction ─────────────────────────────────────────────────────
 
-const HINDSIGHT_SYSTEM_PROMPT = `You are a cross-session pattern detector. You review multiple recent sessions for a project to find patterns that single-session extraction misses.
+const HINDSIGHT_SYSTEM_PROMPT = `You are a repeat-event detector. You review recent sessions to find cases where an existing knowledge atom FAILED to prevent a repeated mistake.
 
 RESPONSE FORMAT: Respond with ONLY a raw JSON object. No markdown code fences. No explanation.
 
-JSON schema:
 {
   "atoms": [
     {
-      "content": "concise headline of the cross-session pattern",
-      "context": "detailed explanation: which sessions showed this pattern, what recurred, why it matters",
-      "scope": "project|global"
+      "content": "When X, do/don't Y because Z",
+      "context": "brief context, max 200 chars",
+      "scope": "project|global",
+      "justification": "which recurring problem this addresses and why no existing atom covers it"
     }
   ],
   "repeat_events": [
@@ -906,17 +984,20 @@ JSON schema:
   ]
 }
 
-Focus on:
-1. RECURRING PROBLEMS: Same mistake, error, or confusion appearing across multiple sessions
-2. EMERGING PATTERNS: Approaches or solutions that keep working (or failing) across sessions
-3. MISSED EXTRACTIONS: Important knowledge from past sessions that wasn't captured
-4. REPEAT EVENTS: Cases where an existing atom should have prevented a mistake but didn't
+Focus EXCLUSIVELY on:
+1. REPEAT EVENTS: An existing atom should have prevented a mistake but the same mistake happened again. Flag these.
+2. UNADDRESSED RECURRING PROBLEMS: The same mistake happened in 2+ sessions but NO existing atom covers it. Only then create 1 atom.
+
+Do NOT look for:
+- Emerging patterns or trends
+- Missed single-session extractions
+- General observations about the sessions
 
 Rules:
-- Maximum 2 atoms. Most reviews produce 0.
-- Only extract if you see a CROSS-SESSION pattern. Single-session observations should have been caught already.
+- Maximum 1 atom. Only for true recurring problems with no existing atom coverage.
+- Atom content MUST be prescriptive: "When X, do/don't Y because Z".
 - For repeat_events: only flag cases where an existing atom directly relates to a mistake that was repeated.
-- All arrays are optional. Return {} if nothing stands out.`;
+- All arrays are optional. Return {} if nothing stands out (this is the expected case).`;
 
 async function processHindsightExtraction(db, project, projectName) {
   // Load last 5 threads for this project
@@ -1023,12 +1104,15 @@ async function processHindsightExtraction(db, project, projectName) {
 
   // Store atoms with higher initial confidence (cross-session patterns are more reliable)
   let atomCount = 0;
-  const atoms = Array.isArray(result.atoms) ? result.atoms : [];
-  for (const item of atoms.slice(0, 2)) {
+  let atoms = Array.isArray(result.atoms) ? result.atoms.slice(0, 1) : [];
+  atoms = await validateAtoms(atoms);
+
+  for (const item of atoms) {
     if (!item.content) continue;
     try {
       const meta = {};
       if (item.context) meta.context = item.context;
+      if (item.justification) meta.justification = item.justification;
       meta.source = "hindsight";
 
       const scope = item.scope || "project";

@@ -43,6 +43,7 @@ The definitive blueprint for the memory system rebuild. Every detail needed to i
 | Phase 3: ACT-R | COMPLETED | 2026-03-07 | See Phase 3 notes below. |
 | Phase 4: Advanced | COMPLETED | 2026-03-07 | See Phase 4 notes below. |
 | Phase 4b: Architectural | COMPLETED | 2026-03-08 | Transcript truncation, tool consolidation (5->3), injection cache. See Phase 4b notes below. |
+| Phase 5: Atom Quality | COMPLETED | 2026-03-09 | Extraction rewrite (4 gates, prescriptive format), Haiku validator, intent-based injection. See Phase 5 notes below. |
 
 ### Phase 3 Implementation Notes
 
@@ -71,6 +72,26 @@ The definitive blueprint for the memory system rebuild. Every detail needed to i
 25. **Tool consolidation (5 to 3)** - Merged `memory_feedback`, `memory_admin`, and `ingest_new_sessions` into a single `memory_manage` tool. Reduces MCP tool context overhead from 5 tool definitions to 3. The `memory_manage` tool uses an `action` enum to route: `feedback`, `batch_feedback`, `list`, `view`, `delete`, `edit`, `recent_extractions`, `reextract`, `archive_project`, `purge_archived`, `summary`, `stale`, `low_confidence`, `most_used`, `disk_usage`, `ingest_sessions`. All handler logic preserved, just reorganized under one tool. CLAUDE.md commands updated to use `memory_manage(action='...')`.
 
 26. **Injection cache** - New `injection_cache` table pre-computes vector-quality atom matches per project so hooks can use semantic matching without live embedding calls (hooks have 500ms-1s timeouts, too short for API calls). Worker runs `refreshInjectionCache(project)` at the end of each ingestion. Process: loads all active atom embeddings for the project, generates embedding for project name (top 10 stored as `context_type='project_general'`), generates embeddings for file basenames extracted from recent atoms (top 5 per file stored as `context_type='file:<basename>'`). Hooks query cache first, fall back to FTS when cache is empty. `post-tool-use.sh` uses `file:<basename>` cache entries. `session-start-compact.sh` uses `project_general` cache entries. `user-prompt-submit.sh` unchanged (query-specific signals can't be pre-computed).
+
+### Phase 5: Atom Quality - COMPLETED 2026-03-09
+
+Problem: ~90% of extracted atoms were journal entries (task completions, resolved bugs, schema state) rather than actionable knowledge. The extraction prompt's "changes behavior" gate was interpreted too loosely.
+
+27. **Extraction prompt rewrite** - Complete rewrite of `EXTRACTION_SYSTEM_PROMPT`. Added 4th gate: DURABLE ("Would this still prevent a mistake or save time 2 weeks from now?"). Enforced prescriptive format: all atom content must be "When X, do/don't Y because Z". Context capped at 200 chars (was unbounded "full war story"). Max atoms reduced from 3 to 2. Expanded DO NOT EXTRACT with concrete anti-examples: task completion reports, already-fixed bugs, code/schema state, meta-observations. New response fields: `justification` (which gates the atom passes), `obsolete_atom_ids` (existing atoms to auto-archive).
+
+28. **Haiku validator** - New `validateAtoms()` function runs a second-pass validation via Haiku CLI. For each atom: KEEP or REJECT based on: descriptive vs prescriptive, stale in 2 weeks, discoverable from code, weak justification. Fail-open: if Haiku call errors, all atoms are kept. Applied to both main extraction and hindsight atoms.
+
+29. **`callClaudeCLI` model parameter** - Added `model` parameter (default "sonnet"). Validator uses "haiku".
+
+30. **`storeAtom` changes** - `justification` added to metadata skip set (stored in metadata JSON but not merged into atom content). Context truncated to 200 chars belt-and-suspenders (prompt also instructs 200 max).
+
+31. **Obsolete atom auto-archiving** - After storage loop, iterates `extraction.obsolete_atom_ids`. For each: verifies atom exists and is active, sets `status = 'archived'`, deletes embedding. Follows existing consolidation archive pattern.
+
+32. **Existing atoms context reframing** - Header changed from "EXISTING KNOWLEDGE (do NOT re-extract these)" to "EXISTING ATOMS (do NOT re-extract)" with instruction to add obsolete IDs to `obsolete_atom_ids`.
+
+33. **Hindsight prompt rewrite** - Narrowed focus exclusively to repeat events (recurring problems with no existing atom coverage). Removed "EMERGING PATTERNS" and "MISSED EXTRACTIONS". Max atoms reduced from 2 to 1. Same prescriptive format + justification as main extraction.
+
+34. **Intent-based injection (Signal 5)** - `user-prompt-submit.sh` previously required one of 4 specific signals (file path, error string, PascalCase, problem word) before FTS search would run. This meant most "about to make a mistake" prompts never reached FTS, even when matching atoms existed. Added Signal 5: any prompt >= 40 chars with 3+ significant non-stopword terms triggers OR-based FTS search with a higher confidence floor (0.80 vs 0.70 for signals 1-4). Signals 1-4 still take priority (checked first). Extensive stopword list prevents noise from common terms.
 
 ### Items NOT Implemented (with reasons)
 
